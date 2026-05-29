@@ -61,6 +61,10 @@ IDLE_QUIPS = [
 ]
 QUIP_ROTATE_MS = 25000   # nowy żart co ~25s w stanie idle
 
+MASCOT_ACTIVE = "😎"
+MASCOT_IDLE_POOL = ["😔", "😒", "😟"]
+MASCOT_SIZE = 56
+
 
 def log(msg: str) -> None:
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +124,32 @@ def nag_status() -> tuple[str, str]:
 
 def pick_font(preferred: str, fallback: str) -> str:
     return preferred if preferred in set(tkfont.families()) else fallback
+
+
+def _sum_today_from_history(timer: dict) -> int:
+    """Sum seconds logged TODAY on this task (excluding current running session).
+
+    Everhour returns `currentTaskTime.history` with entries having
+    `time` (running total after this entry) and `previousTime` (before),
+    so the per-entry delta is (time - previousTime). `userDate` is the
+    user's current local date in YYYY-MM-DD form — we match createdAt
+    prefix against it.
+    """
+    today = timer.get("userDate", "")
+    if not today:
+        return 0
+    history = ((timer.get("currentTaskTime") or {}).get("history")) or []
+    total = 0
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        created = entry.get("createdAt", "")
+        if not created.startswith(today):
+            continue
+        delta = int(entry.get("time", 0)) - int(entry.get("previousTime", 0))
+        if delta > 0:
+            total += delta
+    return total
 
 
 class Widget:
@@ -205,26 +235,42 @@ class Widget:
         center.pack(fill="both", expand=True, pady=(8, 0))
         self._center = center
         self._top = top
-        self.task_lbl = tk.Label(center, text="", fg=MUTED, bg=BLACK,
+
+        # Mascot on the right; text column on the left
+        self.mascot = tk.Label(center, text="", bg=BLACK,
+                               font=("Helvetica Neue", MASCOT_SIZE))
+        self.mascot.pack(side="right", padx=(10, 0))
+        text_col = tk.Frame(center, bg=BLACK)
+        text_col.pack(side="left", fill="both", expand=True)
+        self._text_col = text_col
+        self.task_lbl = tk.Label(text_col, text="", fg=MUTED, bg=BLACK,
                                  font=F_TASK, anchor="w")
         self.task_lbl.pack(fill="x")
-        self.big_lbl = tk.Label(center, text="", fg=WHITE, bg=BLACK,
+        big_row = tk.Frame(text_col, bg=BLACK)
+        big_row.pack(fill="x")
+        self._big_row = big_row
+        self.big_lbl = tk.Label(big_row, text="", fg=WHITE, bg=BLACK,
                                 font=F_BIG, anchor="w")
-        self.big_lbl.pack(fill="x")
+        self.big_lbl.pack(side="left")
+        self.total_lbl = tk.Label(big_row, text="", fg=MUTED, bg=BLACK,
+                                  font=(fam, 12), anchor="sw", pady=18)
+        self.total_lbl.pack(side="left", padx=(12, 0))
 
         # Click-anywhere-but-close opens Everhour. Drag from top bar moves window.
         self._press_xy = None
         self._press_root = None
         click_targets = [outer, top, self.dot, self.status, self.cta, center,
-                         self.task_lbl, self.big_lbl]
+                         text_col, self.task_lbl, big_row,
+                         self.big_lbl, self.total_lbl, self.mascot]
         for w in click_targets:
             w.bind("<ButtonPress-1>", self._on_press)
             w.bind("<B1-Motion>", self._on_motion)
             w.bind("<ButtonRelease-1>", self._on_release)
 
         self._state = None
-        self._duration = 0
-        self._previous = 0  # seconds previously logged on this task
+        self._duration = 0       # current running session
+        self._today_logged = 0   # seconds already logged today on this task
+        self._lifetime = 0       # life-of-task total (already logged)
         self._dragging = False
         self._nag_state = None
 
@@ -332,18 +378,25 @@ class Widget:
     def _set_main_bg(self, bg: str):
         """Repaint top + center (not footer, not accent stripes, not CTA)."""
         for w in (self.root, self._outer, self._top, self._center,
-                  self.dot, self.status, self.task_lbl, self.big_lbl):
+                  self._text_col, self.dot, self.status, self.task_lbl,
+                  self._big_row, self.big_lbl, self.total_lbl, self.mascot):
             w.config(bg=bg)
 
+
     def _render_idle(self):
+        first_time = self._state != "idle"
         self._state = "idle"
         self._set_main_bg(IDLE_BG)
         self.dot.config(fg=WHITE)
         self.status.config(text="NOT TRACKING", fg=WHITE)
-        self.task_lbl.config(text="Everhour mruga ostrzegawczo.", fg=IDLE_MUTED)
-        self.big_lbl.config(text="Włącz timer ⚠️", fg=WHITE,
+        self.task_lbl.config(text="Chyba o czymś zapomniałeś…", fg=IDLE_MUTED)
+        self.big_lbl.config(text="Włącz timer!", fg=WHITE,
                             font=self._F_BIG, justify="left")
-        self.cta.pack_forget()
+        self.total_lbl.config(text="")
+        if first_time:
+            self.mascot.config(text=random.choice(MASCOT_IDLE_POOL))
+        # CTA stays in place — black pill with white text on the red bg
+        self.cta.config(bg=BLACK, fg=WHITE)
 
     def _render_active(self, task_name: str):
         self._state = "active"
@@ -351,18 +404,30 @@ class Widget:
         self.dot.config(fg=GREEN)
         self.status.config(text="TRACKING", fg=MUTED)
         self.task_lbl.config(text=task_name or "—", fg=MUTED)
-        self.big_lbl.config(text=fmt_duration(self._duration + self._previous),
+        self._refresh_time_labels()
+        self.mascot.config(text=MASCOT_ACTIVE)
+        # Restore green CTA palette
+        self.cta.config(bg=GREEN, fg=BLACK)
+
+
+    def _refresh_time_labels(self):
+        today = self._duration + self._today_logged
+        total = self._duration + self._lifetime
+        self.big_lbl.config(text=fmt_duration(today),
                             fg=WHITE, font=self._F_BIG, justify="left")
-        # Re-show the CTA if it was hidden in the idle state
-        if not self.cta.winfo_ismapped():
-            self.cta.pack(side="right")
+        # Hide total if it equals today (i.e. first time on this task)
+        if total > today:
+            h, rem = divmod(total, 3600)
+            m, _ = divmod(rem, 60)
+            self.total_lbl.config(text=f"total {h}:{m:02d}", fg=MUTED)
+        else:
+            self.total_lbl.config(text="")
 
     # --- local 1s tick: counter + event-loop pump (keeps clicks responsive) ---
     def tick(self):
         if self._state == "active":
             self._duration += 1
-            self.big_lbl.config(
-                text=fmt_duration(self._duration + self._previous))
+            self._refresh_time_labels()
         self.root.after(TICK_MS, self.tick)
 
     # --- network sync every 30s ---
@@ -387,7 +452,8 @@ class Widget:
         if timer.get("status") == "active":
             task = timer.get("task") or {}
             self._duration = int(timer.get("duration", 0))
-            self._previous = int((task.get("time") or {}).get("total", 0))
+            self._lifetime = int((task.get("time") or {}).get("total", 0))
+            self._today_logged = _sum_today_from_history(timer)
             self._render_active(task.get("name", ""))
         else:
             self._render_idle()
