@@ -1,0 +1,17 @@
+# Per-user state — never commit
+.everhour-token
+.everhour-widget-pos
+.everhour-nag-snooze
+*.log
+
+# The plist contains an absolute path with the maintainer's username.
+# The README shows how to generate a fresh one with $HOME, so we don't ship it.
+com.wojtek.everhour-nag.plist
+
+# macOS junk
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
