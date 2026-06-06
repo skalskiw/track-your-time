@@ -10,10 +10,17 @@ from pathlib import Path
 
 TOKEN_FILE = Path.home() / ".everhour-token"
 SNOOZE_FILE = Path.home() / ".everhour-nag-snooze"
+SETTINGS_FILE = Path.home() / ".everhour-settings.json"
 EVERHOUR_URL = "https://app.everhour.com/#/time"
 API_URL = "https://api.everhour.com/timers/current"
 LOG_FILE = Path.home() / "Library/Logs/everhour-nag.log"
 TZ_WARSAW = "Europe/Warsaw"
+
+DEFAULT_SETTINGS = {
+    "schedule": "weekdays",   # "always" | "weekdays"
+    "start_hour": 8,
+    "end_hour": 17,
+}
 
 
 def log(msg: str) -> None:
@@ -70,6 +77,25 @@ def now_warsaw():
     from datetime import datetime
     from zoneinfo import ZoneInfo
     return datetime.now(ZoneInfo(TZ_WARSAW))
+
+
+def is_off_hours() -> bool:
+    """Skip nags outside configured business hours. Shared file with the widget."""
+    s = dict(DEFAULT_SETTINGS)
+    try:
+        if SETTINGS_FILE.exists():
+            with SETTINGS_FILE.open() as f:
+                s.update(json.load(f))
+    except Exception as e:
+        log(f"settings load: {e}")
+    if s.get("schedule") == "always":
+        return False
+    n = now_warsaw()
+    if n.weekday() >= 5:        # Sat / Sun
+        return True
+    start = int(s.get("start_hour", 8))
+    end = int(s.get("end_hour", 17))
+    return not (start <= n.hour < end)
 
 
 def snooze_active() -> bool:
@@ -134,6 +160,10 @@ def main() -> None:
 
     if snooze_active():
         log("Snooze aktywny — pomijam")
+        return
+
+    if is_off_hours():
+        log("Off-hours — pomijam (settings)")
         return
 
     token = read_token()

@@ -16,6 +16,7 @@ TOKEN_FILE = Path.home() / ".everhour-token"
 POS_FILE = Path.home() / ".everhour-widget-pos"
 LOG_FILE = Path.home() / "Library/Logs/everhour-widget.log"
 SNOOZE_FILE = Path.home() / ".everhour-nag-snooze"
+SETTINGS_FILE = Path.home() / ".everhour-settings.json"
 API_URL = "https://api.everhour.com/timers/current"
 EVERHOUR_URL = "https://app.everhour.com/#/time"
 NAG_SCRIPT = Path.home() / "bin" / "everhour_nag.py"
@@ -32,7 +33,15 @@ MUTED = "#9CA3AF"
 RED = "#EF4444"
 IDLE_BG = "#7F1D1D"        # red-900 — alarm-status background, not loud
 IDLE_MUTED = "#FCA5A5"     # red-300 — muted text on the dark red bg
+OFF_BG = "#1E40AF"         # blue-800 — off-hours chill background
+OFF_MUTED = "#BFDBFE"      # blue-200 — muted text on the blue bg
 ACCENT_H = 4        # height of the top accent stripe (under title bar)
+
+DEFAULT_SETTINGS = {
+    "schedule": "weekdays",   # "always" | "weekdays"
+    "start_hour": 8,
+    "end_hour": 17,
+}
 
 IDLE_QUIPS = [
     "Czas to pieniądz. A ty go nie trackujesz.",
@@ -63,6 +72,7 @@ QUIP_ROTATE_MS = 25000   # nowy żart co ~25s w stanie idle
 
 MASCOT_ACTIVE = "😎"
 MASCOT_IDLE_POOL = ["😔", "😒", "😟"]
+MASCOT_OFF = "🏖️"
 MASCOT_SIZE = 56
 
 
@@ -73,8 +83,65 @@ def log(msg: str) -> None:
         f.write(f"{datetime.now().isoformat(timespec='seconds')} {msg}\n")
 
 
+def load_settings() -> dict:
+    try:
+        if SETTINGS_FILE.exists():
+            with SETTINGS_FILE.open() as f:
+                return {**DEFAULT_SETTINGS, **json.load(f)}
+    except Exception as e:
+        log(f"load_settings: {e}")
+    return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(s: dict) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(s, indent=2))
+    except Exception as e:
+        log(f"save_settings: {e}")
+
+
+def is_off_hours(settings: dict | None = None) -> bool:
+    """True if widget should be in chill/off mode (outside configured hours)."""
+    from datetime import datetime
+    s = settings if settings is not None else load_settings()
+    if s.get("schedule") == "always":
+        return False
+    now = datetime.now()
+    if now.weekday() >= 5:              # Sat / Sun
+        return True
+    start = int(s.get("start_hour", 8))
+    end = int(s.get("end_hour", 17))
+    return not (start <= now.hour < end)
+
+
+def off_hours_return_text(settings: dict | None = None) -> str:
+    """Friendly 'Wracamy ...' label pointing to the next business-hours start."""
+    from datetime import datetime
+    s = settings if settings is not None else load_settings()
+    start = int(s.get("start_hour", 8))
+    now = datetime.now()
+    wd = now.weekday()
+    if wd < 5 and now.hour < start:
+        return "Wracamy niedługo"
+    if wd in (4, 5, 6):                 # Fri after hours / Sat / Sun
+        return "Wracamy w poniedziałek"
+    return "Wracamy jutro"
+
+
 def read_token() -> str | None:
     return TOKEN_FILE.read_text().strip() if TOKEN_FILE.exists() else None
+
+
+def stop_timer(token: str) -> None:
+    """Fire DELETE /timers/current — ignore result, optimistic UI handles it."""
+    try:
+        subprocess.run(
+            ["curl", "-fsS", "--max-time", "10",
+             "-X", "DELETE", "-H", f"X-Api-Key: {token}", API_URL],
+            capture_output=True, timeout=15,
+        )
+    except Exception as e:
+        log(f"stop_timer error: {e}")
 
 
 def fetch_timer(token: str) -> dict | None:
@@ -171,14 +238,17 @@ class Widget:
             pass
 
         fam = pick_font("Poppins", "Helvetica Neue")
+        self._fam = fam
         F_BIG = (fam, 44, "bold")
         F_IDLE = (fam, 32, "bold")
+        F_OFF = (fam, 22, "bold")
         F_TASK = (fam, 13)
         F_STATUS = (fam, 10, "bold")
         F_HINT = (fam, 11)
         F_DOT = (fam, 14)
         self._F_BIG = F_BIG
         self._F_IDLE = F_IDLE
+        self._F_OFF = F_OFF
 
         x, y = self._load_pos()
         self.root.geometry(f"460x230+{x}+{y}")
@@ -192,6 +262,12 @@ class Widget:
         sep.pack(fill="x", side="bottom")
         footer = tk.Frame(self.root, bg=BLACK, padx=20, pady=10)
         footer.pack(fill="x", side="bottom")
+
+        # Gear icon (settings) — far left
+        self.gear = tk.Label(footer, text="⚙", fg=MUTED, bg=BLACK,
+                             font=(fam, 14), cursor="pointinghand")
+        self.gear.pack(side="left", padx=(0, 10))
+        self.gear.bind("<ButtonRelease-1>", lambda _e: self._open_settings())
 
         self.nag_lbl = tk.Label(footer, text="NAG: …",
                                 fg=MUTED, bg=BLACK, font=(fam, 10, "bold"))
@@ -236,31 +312,44 @@ class Widget:
         self._center = center
         self._top = top
 
-        # Mascot on the right; text column on the left
+        # Mascot on the far right; STOP icon between timer and mascot; text column on the left
         self.mascot = tk.Label(center, text="", bg=BLACK,
                                font=("Helvetica Neue", MASCOT_SIZE))
         self.mascot.pack(side="right", padx=(10, 0))
+
+        # STOP icon — red circle with a white square. Stationary, only shown when active.
+        # Bound directly (not via click_targets) so it doesn't open Everhour.
+        STOP_SIZE = 44
+        self.stop_btn = tk.Canvas(center, width=STOP_SIZE, height=STOP_SIZE,
+                                  bg=BLACK, highlightthickness=0, bd=0,
+                                  cursor="pointinghand")
+        self.stop_btn.create_oval(2, 2, STOP_SIZE - 2, STOP_SIZE - 2,
+                                  fill=RED, outline=RED)
+        sq = STOP_SIZE * 0.32
+        cx = STOP_SIZE / 2
+        self.stop_btn.create_rectangle(cx - sq / 2, cx - sq / 2,
+                                       cx + sq / 2, cx + sq / 2,
+                                       fill=WHITE, outline=WHITE)
+        self.stop_btn.bind("<ButtonRelease-1>", lambda _e: self._on_stop())
+
         text_col = tk.Frame(center, bg=BLACK)
         text_col.pack(side="left", fill="both", expand=True)
         self._text_col = text_col
         self.task_lbl = tk.Label(text_col, text="", fg=MUTED, bg=BLACK,
                                  font=F_TASK, anchor="w")
         self.task_lbl.pack(fill="x")
-        big_row = tk.Frame(text_col, bg=BLACK)
-        big_row.pack(fill="x")
-        self._big_row = big_row
-        self.big_lbl = tk.Label(big_row, text="", fg=WHITE, bg=BLACK,
+        self.big_lbl = tk.Label(text_col, text="", fg=WHITE, bg=BLACK,
                                 font=F_BIG, anchor="w")
-        self.big_lbl.pack(side="left")
-        self.total_lbl = tk.Label(big_row, text="", fg=MUTED, bg=BLACK,
-                                  font=(fam, 12), anchor="sw", pady=18)
-        self.total_lbl.pack(side="left", padx=(12, 0))
+        self.big_lbl.pack(fill="x")
+        self.total_lbl = tk.Label(text_col, text="", fg=MUTED, bg=BLACK,
+                                  font=(fam, 11), anchor="w")
+        self.total_lbl.pack(fill="x")
 
         # Click-anywhere-but-close opens Everhour. Drag from top bar moves window.
         self._press_xy = None
         self._press_root = None
         click_targets = [outer, top, self.dot, self.status, self.cta, center,
-                         text_col, self.task_lbl, big_row,
+                         text_col, self.task_lbl,
                          self.big_lbl, self.total_lbl, self.mascot]
         for w in click_targets:
             w.bind("<ButtonPress-1>", self._on_press)
@@ -379,7 +468,7 @@ class Widget:
         """Repaint top + center (not footer, not accent stripes, not CTA)."""
         for w in (self.root, self._outer, self._top, self._center,
                   self._text_col, self.dot, self.status, self.task_lbl,
-                  self._big_row, self.big_lbl, self.total_lbl, self.mascot):
+                  self.big_lbl, self.total_lbl, self.mascot):
             w.config(bg=bg)
 
 
@@ -397,6 +486,8 @@ class Widget:
             self.mascot.config(text=random.choice(MASCOT_IDLE_POOL))
         # CTA stays in place — black pill with white text on the red bg
         self.cta.config(bg=BLACK, fg=WHITE)
+        # No active timer to stop
+        self.stop_btn.pack_forget()
 
     def _render_active(self, task_name: str):
         self._state = "active"
@@ -408,6 +499,36 @@ class Widget:
         self.mascot.config(text=MASCOT_ACTIVE)
         # Restore green CTA palette
         self.cta.config(bg=GREEN, fg=BLACK)
+        # Show STOP icon between text_col and mascot (only while tracking)
+        if not self.stop_btn.winfo_ismapped():
+            self.stop_btn.pack(side="right", padx=(16, 4), before=self.mascot)
+        self.stop_btn.config(bg=BLACK)
+
+    def _render_off(self):
+        """Outside business hours — chill blue, no tracking nag."""
+        self._state = "off"
+        self._set_main_bg(OFF_BG)
+        self.dot.config(fg=WHITE)
+        self.status.config(text="OFF HOURS", fg=WHITE)
+        self.task_lbl.config(text="Po godzinach. Spokojnie.", fg=OFF_MUTED)
+        self.big_lbl.config(text=off_hours_return_text(),
+                            fg=WHITE, font=self._F_OFF, justify="left")
+        self.total_lbl.config(text="")
+        self.mascot.config(text=MASCOT_OFF)
+        # CTA stays in place but in muted palette (nothing urgent to do)
+        self.cta.config(bg=BLACK, fg=WHITE)
+        # No active timer to stop
+        self.stop_btn.pack_forget()
+
+    def _on_stop(self):
+        log("stop click")
+        # Optimistic UI: switch to idle instantly, then hit API in the background
+        self._render_idle()
+        if self.token:
+            threading.Thread(
+                target=lambda: stop_timer(self.token),
+                daemon=True,
+            ).start()
 
 
     def _refresh_time_labels(self):
@@ -445,16 +566,111 @@ class Widget:
         self._refresh_nag()
         self.root.after(SYNC_MS, self.sync)
 
+    # --- settings dialog ---
+    def _open_settings(self):
+        win = tk.Toplevel(self.root)
+        win.title("Everhour Widget — Settings")
+        win.configure(bg=BLACK)
+        win.resizable(False, False)
+        try:
+            win.transient(self.root)
+        except Exception:
+            pass
+
+        s = load_settings()
+        fam = self._fam
+        PAD_X = 24
+
+        tk.Label(win, text="When should the widget bug you?",
+                 bg=BLACK, fg=WHITE, font=(fam, 12, "bold"),
+                 anchor="w").pack(fill="x", padx=PAD_X, pady=(20, 10))
+
+        schedule_var = tk.StringVar(value=s.get("schedule", "weekdays"))
+        radio_kwargs = dict(bg=BLACK, fg=WHITE,
+                            selectcolor=BLACK,
+                            activebackground=BLACK, activeforeground=WHITE,
+                            highlightthickness=0, font=(fam, 11),
+                            anchor="w")
+        tk.Radiobutton(win, text="Always — every day, all the time",
+                       variable=schedule_var, value="always",
+                       **radio_kwargs).pack(fill="x", padx=PAD_X)
+        tk.Radiobutton(win, text="Workdays only, business hours",
+                       variable=schedule_var, value="weekdays",
+                       **radio_kwargs).pack(fill="x", padx=PAD_X)
+
+        tk.Label(win, text="Business hours (Mon–Fri):",
+                 bg=BLACK, fg=MUTED, font=(fam, 10),
+                 anchor="w").pack(fill="x", padx=PAD_X, pady=(16, 4))
+
+        hours = tk.Frame(win, bg=BLACK)
+        hours.pack(fill="x", padx=PAD_X)
+
+        start_var = tk.IntVar(value=int(s.get("start_hour", 8)))
+        end_var = tk.IntVar(value=int(s.get("end_hour", 17)))
+
+        tk.Label(hours, text="from", bg=BLACK, fg=WHITE,
+                 font=(fam, 11)).pack(side="left")
+        tk.Spinbox(hours, from_=0, to=23, width=3, textvariable=start_var,
+                   font=(fam, 11)).pack(side="left", padx=6)
+        tk.Label(hours, text=":00    to", bg=BLACK, fg=WHITE,
+                 font=(fam, 11)).pack(side="left")
+        tk.Spinbox(hours, from_=0, to=23, width=3, textvariable=end_var,
+                   font=(fam, 11)).pack(side="left", padx=6)
+        tk.Label(hours, text=":00", bg=BLACK, fg=WHITE,
+                 font=(fam, 11)).pack(side="left")
+
+        btn_row = tk.Frame(win, bg=BLACK)
+        btn_row.pack(fill="x", padx=PAD_X, pady=(20, 20))
+
+        def do_save():
+            try:
+                sh = max(0, min(23, int(start_var.get())))
+                eh = max(0, min(24, int(end_var.get())))
+                if eh <= sh:
+                    eh = sh + 1
+            except Exception:
+                sh = DEFAULT_SETTINGS["start_hour"]
+                eh = DEFAULT_SETTINGS["end_hour"]
+            save_settings({
+                "schedule": schedule_var.get(),
+                "start_hour": sh,
+                "end_hour": eh,
+            })
+            log(f"settings saved: schedule={schedule_var.get()} {sh}:00-{eh}:00")
+            win.destroy()
+            # Force immediate re-render based on new settings + fresh fetch
+            if self.token:
+                def refresh():
+                    t = fetch_timer(self.token)
+                    self.root.after(0, lambda: self._apply(t))
+                threading.Thread(target=refresh, daemon=True).start()
+
+        cancel = tk.Label(btn_row, text="Cancel", fg=MUTED, bg=BLACK,
+                          font=(fam, 11, "bold"), cursor="pointinghand",
+                          padx=8)
+        cancel.pack(side="right", padx=(8, 0))
+        cancel.bind("<ButtonRelease-1>", lambda _e: win.destroy())
+
+        save_btn = tk.Label(btn_row, text="Save", fg=BLACK, bg=GREEN,
+                            font=(fam, 11, "bold"), cursor="pointinghand",
+                            padx=14, pady=4)
+        save_btn.pack(side="right")
+        save_btn.bind("<ButtonRelease-1>", lambda _e: do_save())
+
     def _apply(self, timer: dict | None):
         if timer is None:
             self.status.config(text="OFFLINE")
             return
+        # Off-hours overrides idle nagging. An active timer still wins (you're
+        # working overtime — show it), but never harass when nothing's running.
         if timer.get("status") == "active":
             task = timer.get("task") or {}
             self._duration = int(timer.get("duration", 0))
             self._lifetime = int((task.get("time") or {}).get("total", 0))
             self._today_logged = _sum_today_from_history(timer)
             self._render_active(task.get("name", ""))
+        elif is_off_hours():
+            self._render_off()
         else:
             self._render_idle()
 
